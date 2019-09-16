@@ -321,7 +321,16 @@ pub trait Group
     fn random<R: Rng>(rng: &mut R) -> Self;
     fn is_zero(&self) -> bool;
     fn normalize(&mut self);
+
+    type Compressed;
+    fn as_compressed(&self) -> Self::Compressed;
+    fn from_compressed(compressed : &Self::Compressed) -> Result<Self, CurveError>;
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "rustc-serialize", derive(RustcDecodable, RustcEncodable))]
+#[repr(C)]
+pub struct G1Compressed(pub u8, pub Fq);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "rustc-serialize", derive(RustcDecodable, RustcEncodable))]
@@ -360,24 +369,6 @@ impl G1 {
     pub fn b() -> Fq {
         Fq(G1Params::coeff_b())
     }
-
-    pub fn from_compressed(bytes: &[u8]) -> Result<Self, CurveError> {
-        if bytes.len() != 33 { return Err(CurveError::InvalidEncoding); }
-
-        let sign = bytes[0];
-        let fq = Fq::from_slice(&bytes[1..])?;
-        let x = fq;
-        let y_squared = (fq * fq * fq) + Self::b();
-
-        let mut y = y_squared.sqrt().ok_or(CurveError::NotMember)?;
-
-        if sign == 2 && y.into_u256().get_bit(0).expect("bit 0 always exist; qed") { y = y.neg(); }
-        else if sign == 3 && !y.into_u256().get_bit(0).expect("bit 0 always exist; qed") { y = y.neg(); }
-        else if sign != 3 && sign != 2 {
-            return Err(CurveError::InvalidEncoding);
-        }
-        AffineG1::new(x, y).map_err(|_| CurveError::NotMember).map(Into::into)
-    }
 }
 
 impl Group for G1 {
@@ -400,6 +391,32 @@ impl Group for G1 {
         };
 
         self.0 = new.to_jacobian();
+    }
+    type Compressed = G1Compressed;
+    fn as_compressed(&self) -> G1Compressed {
+        let mut affine = *self;
+        affine.normalize();
+        // let affine : groups::AffineG1 = self.0.to_affine().unwrap();
+        // let affine_y_u256 : U256 = affine.y().into_u256();
+        let lsb : bool = affine.y().into_u256().get_bit(0).unwrap();
+        G1Compressed(if lsb { 3 } else { 2 }, affine.x())
+    }
+    fn from_compressed(compressed : &G1Compressed) -> Result<G1, CurveError> {
+        let tag = compressed.0;
+        let x = compressed.1;
+        let y_squared = (x * x * x) + Self::b();
+        let mut y = y_squared.sqrt().ok_or(CurveError::NotMember)?;
+        let lsb : bool = y.into_u256().get_bit(0).unwrap();
+
+        if 2 == tag {
+            y = if lsb {y.neg()} else {y};
+        } else if 3 == tag {
+            y = if !lsb {y.neg()} else {y};
+        } else {
+            return Err(CurveError::InvalidEncoding);
+        }
+
+        Ok(Into::into(AffineG1::new(x, y).unwrap()))
     }
 }
 
@@ -472,6 +489,10 @@ impl From<AffineG1> for G1 {
     }
 }
 
+#[cfg_attr(feature = "rustc-serialize", derive(RustcDecodable, RustcEncodable))]
+#[repr(C)]
+pub struct G2Compressed(u8, fields::Fq2);
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "rustc-serialize", derive(RustcDecodable, RustcEncodable))]
 #[repr(C)]
@@ -509,28 +530,6 @@ impl G2 {
     pub fn b() -> Fq2 {
         Fq2(G2Params::coeff_b())
     }
-
-    pub fn from_compressed(bytes: &[u8]) -> Result<Self, CurveError> {
-
-        if bytes.len() != 65 { return Err(CurveError::InvalidEncoding); }
-
-        let sign = bytes[0];
-        let x = Fq2::from_slice(&bytes[1..])?;
-
-        let y_squared = (x * x * x) + G2::b();
-        let y = y_squared.sqrt().ok_or(CurveError::NotMember)?;
-        let y_neg = -y;
-
-        let y_gt = y.0.to_u512() > y_neg.0.to_u512();
-
-        let e_y = if sign == 10 { if y_gt { y_neg } else { y } }
-        else if sign == 11 { if y_gt { y } else { y_neg } }
-        else {
-            return Err(CurveError::InvalidEncoding);
-        };
-
-        AffineG2::new(x, e_y).map_err(|_| CurveError::NotMember).map(Into::into)
-    }
 }
 
 impl Group for G2 {
@@ -553,6 +552,33 @@ impl Group for G2 {
         };
 
         self.0 = new.to_jacobian();
+    }
+    type Compressed = G2Compressed;
+    fn as_compressed(&self) -> G2Compressed {
+        let affine : groups::AffineG2 = self.0.to_affine().unwrap();
+        let y = affine.y();
+        let y_neg = y.neg();
+        let y_gt = y.to_u512() > y_neg.to_u512();
+        G2Compressed(
+            if y_gt { 11 } else { 10 },
+            *affine.x())
+    }
+    fn from_compressed(compressed : &G2Compressed) -> Result<G2, CurveError> {
+        let tag = compressed.0;
+        let x = compressed.1;
+        let y_squared = (x * x * x) + Self::b().0;
+        let y = y_squared.sqrt().ok_or(CurveError::NotMember).unwrap();
+        let y_neg = y.neg();
+        let y_gt = y.to_u512() > y_neg.to_u512();
+        if 11 == tag {
+            let y = if y_gt { y } else { y_neg };
+            Ok(Into::into(AffineG2::new(Fq2(x), Fq2(y)).unwrap()))
+        } else if 10 == tag {
+            let y = if y_gt { y_neg } else { y };
+            Ok(Into::into(AffineG2::new(Fq2(x), Fq2(y)).unwrap()))
+        } else {
+            Err(CurveError::InvalidEncoding)
+        }
     }
 }
 
@@ -666,8 +692,10 @@ impl From<AffineG2> for G2 {
 #[cfg(test)]
 mod tests {
     extern crate rustc_hex as hex;
+    extern crate bincode;
 
-    use super::{G1, Fq, G2, Fq2};
+    use super::{G1, G1Compressed, Fq, G2, G2Compressed, Fq2, Group};
+    use self::bincode::rustc_serialize::decode;
 
     fn hex(s: &'static str) -> Vec<u8> {
         use self::hex::FromHex;
@@ -676,19 +704,20 @@ mod tests {
 
     #[test]
     fn g1_from_compressed() {
-        let g1 = G1::from_compressed(&hex("0230644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd46"))
-            .expect("Invalid g1 decompress result");
+        let g1_comp : G1Compressed = decode(
+            &hex("0230644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd46")).unwrap();
+        let g1 = G1::from_compressed(&g1_comp).expect("Invalid g1 decompress result");
         assert_eq!(g1.x(), Fq::from_str("21888242871839275222246405745257275088696311157297823662689037894645226208582").unwrap());
         assert_eq!(g1.y(), Fq::from_str("3969792565221544645472939191694882283483352126195956956354061729942568608776").unwrap());
         assert_eq!(g1.z(), Fq::one());
+        assert_eq!(g1, Group::from_compressed(&g1.as_compressed()).unwrap());
     }
-
 
     #[test]
     fn g2_from_compressed() {
-        let g2 = G2::from_compressed(
-            &hex("0a023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")
-        ).expect("Valid g2 point hex encoding");
+        let g2_comp : G2Compressed = decode(
+            &hex("0a023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")).unwrap();
+        let g2 = G2::from_compressed(&g2_comp).expect("Valid g2 point hex encoding");
 
         assert_eq!(g2.x(),
                    Fq2::new(
@@ -706,8 +735,8 @@ mod tests {
 
         // 0b prefix is point reflection on the curve
         let g2 = -G2::from_compressed(
-            &hex("0b023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")
-        ).expect("Valid g2 point hex encoding");
+            &decode(&hex("0b023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")
+        ).unwrap()).expect("Valid g2 point hex encoding");
 
         assert_eq!(g2.x(),
                    Fq2::new(
@@ -726,8 +755,10 @@ mod tests {
         // valid point but invalid sign prefix
         assert!(
             G2::from_compressed(
-                &hex("0c023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")
+                &decode(&hex("0c023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a761efc6e4fa08ed227650134b52c7f7dd0463963e8a4bf21f4899fe5da7f984a")).unwrap()
             ).is_err()
         );
+
+        assert_eq!(g2, Group::from_compressed(&g2.as_compressed()).unwrap());
     }
 }
